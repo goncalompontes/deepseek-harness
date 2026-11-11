@@ -35,6 +35,50 @@ interface AcpSessionBuildOptions {
   agentOptions: AgentOptions
   signal: AbortSignal
   notify: (notification: SessionNotification) => Promise<void>
+  /** Publish native subagent children as ACP child-session updates (opt-in extension). */
+  exposeSubagentSessions?: boolean
+}
+
+/** The subset of `subagent/start` we need without depending on the subagent package. */
+interface SubagentStartInfo {
+  readonly runId: string
+  readonly provider: string
+  readonly id: SessionId
+  readonly local: boolean
+}
+
+/** The subset of `subagent/end` we need without depending on the subagent package. */
+interface SubagentEndInfo extends SubagentStartInfo {
+  readonly stopReason: string
+  readonly lastAssistantMessage?: readonly { readonly type?: string; readonly text?: string }[]
+}
+
+/** Custom update metadata consumed by ACP clients that surface provider-native subagents. */
+export const DEEPSEEK_SUBAGENT_META = 'deepseek.ai/subagent'
+
+/** Publish one native child lifecycle frame under the child's own session id. */
+export function subagentStateNotification(
+  parentSessionId: SessionId,
+  info: SubagentStartInfo,
+  state: 'running' | 'idle',
+  stopReason?: string,
+): SessionNotification {
+  return {
+    sessionId: info.id,
+    update: {
+      sessionUpdate: 'state_update',
+      state,
+      ...(state === 'idle' && stopReason !== undefined ? { stopReason } : {}),
+      _meta: {
+        [DEEPSEEK_SUBAGENT_META]: {
+          parentSessionId,
+          runId: info.runId,
+          provider: info.provider,
+          local: info.local,
+        },
+      },
+    } as unknown as SessionNotification['update'],
+  }
 }
 
 /** Fresh ACP session construction inputs. */
@@ -97,14 +141,79 @@ export class AcpSession {
   private inflight: InflightPrompt | undefined
   private closing: Promise<void> | undefined
 
+  private readonly childRelays = new Map<string, { runId: string; tail: Promise<void> }>()
+
   private constructor(
     private readonly ctx: Context,
     handle: AgentHandle,
     private readonly notify: (notification: SessionNotification) => Promise<void>,
+    exposeSubagentSessions = false,
   ) {
     this.agent = handle.agent
     this.modelControl = new AcpModelControl(ctx.llm, handle.agent.model)
     this.disposeAgent = () => handle.dispose()
+    if (exposeSubagentSessions) this.mountSubagentExposure()
+  }
+
+  /** Relay native DSH children as ACP child sessions (opt-in extension for compatible clients). */
+  private mountSubagentExposure(): void {
+    const agentEvents = this.agent.ctx as unknown as {
+      on(name: string, listener: (info: SubagentStartInfo & SubagentEndInfo) => void): void
+    }
+    agentEvents.on('subagent/start', (info) => {
+      if (String(info.id) === String(this.agent.session.id)) return
+      this.childRelays.set(String(info.id), { runId: String(info.runId), tail: Promise.resolve() })
+      this.enqueueChild(String(info.id), () => this.notify(
+        subagentStateNotification(this.agent.session.id, info, 'running'),
+      ))
+    })
+    agentEvents.on('subagent/end', (info) => {
+      if (!this.childRelays.has(String(info.id))) return
+      const stopReason = info.stopReason === 'error'
+        ? 'error'
+        : info.stopReason === 'aborted' || info.stopReason === 'cancelled'
+          ? 'cancelled'
+          : 'end_turn'
+      this.enqueueChild(String(info.id), () => this.notify(
+        subagentStateNotification(this.agent.session.id, info, 'idle', stopReason),
+      )).finally(() => this.childRelays.delete(String(info.id)))
+    })
+    this.ctx.on('session/event', (session, event) => {
+      if (!this.childRelays.has(String(session.id))) return
+      this.onChildSessionEvent(session, event)
+    })
+  }
+
+  /** Serialize one child's notification chain without blocking its siblings. */
+  private enqueueChild(childId: string, task: () => Promise<void>): Promise<void> {
+    const relay = this.childRelays.get(childId)
+    if (relay === undefined) return Promise.resolve()
+    const next = relay.tail.then(task).catch((error: unknown) => {
+      this.ctx.logger.warn(`acp: subagent update delivery failed: ${errorChain(error)}`)
+    })
+    relay.tail = next
+    return next
+  }
+
+  /** Reuse the root projection for the child's transcript and tool traffic. */
+  private onChildSessionEvent(session: Session, event: SessionEvent): void {
+    const childId = String(session.id)
+    if (event.type === 'assistant/message') {
+      void this.enqueueChild(childId, async () => {
+        for (const update of await assistantUpdates(this.ctx, session, event)) {
+          await this.notify({ sessionId: childId as SessionId, update })
+        }
+      })
+    } else if (event.type === 'tool/call') {
+      void this.enqueueChild(childId, () => this.notify({
+        sessionId: childId as SessionId,
+        update: toolCallUpdate(event),
+      }))
+    } else if (event.type === 'tool/result') {
+      void this.enqueueChild(childId, async () => {
+        await this.notify({ sessionId: childId as SessionId, update: await toolResultUpdate(this.ctx, event) })
+      })
+    }
   }
 
   private readonly disposeAgent: () => Promise<void>
@@ -123,7 +232,7 @@ export class AcpSession {
       signal: options.signal,
       setup: agentCtx => composeAgent(agentCtx, options),
     })
-    return new AcpSession(ctx, handle, options.notify)
+    return new AcpSession(ctx, handle, options.notify, options.exposeSubagentSessions === true)
   }
 
   /**
@@ -141,7 +250,7 @@ export class AcpSession {
       signal: options.signal,
       setup: agentCtx => composeAgent(agentCtx, options),
     })
-    return new AcpSession(ctx, handle, options.notify)
+    return new AcpSession(ctx, handle, options.notify, options.exposeSubagentSessions === true)
   }
 
   /**

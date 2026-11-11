@@ -78,6 +78,11 @@ export interface AcpConfig {
   model?: string
   /** Maximum summaries returned by one session/list page. */
   sessionListPageSize?: number
+  /**
+   * Publish native subagent children as ACP child-session updates. Off by default because this
+   * is an extension beyond the standard ACP surface; clients that support it can opt in.
+   */
+  exposeSubagentSessions?: boolean
   /** Runtime-only transport override; production uses stdio. */
   stream?: Stream
 }
@@ -86,6 +91,7 @@ export const Config: Schema<AcpConfig> = Schema.object({
   provider: Schema.string(),
   model: Schema.string(),
   sessionListPageSize: Schema.natural().min(1).default(DEFAULT_SESSION_LIST_PAGE_SIZE),
+  exposeSubagentSessions: Schema.boolean().default(false),
 })
 
 /**
@@ -213,6 +219,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           agentOptions: agentOptions(config),
           signal,
           notify,
+          exposeSubagentSessions: config.exposeSubagentSessions === true,
         })
       } catch (error: unknown) {
         if (error instanceof AcpMcpConfigError) throw invalidParams(error.message)
@@ -263,6 +270,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
             agentOptions: agentOptions(config),
             signal,
             notify,
+            exposeSubagentSessions: config.exposeSubagentSessions === true,
           })
         } catch (error: unknown) {
           if (error instanceof AcpMcpConfigError) throw invalidParams(error.message)

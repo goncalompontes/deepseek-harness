@@ -265,10 +265,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           properties: {
             kind: { type: 'string', required: true, const: 'activation' },
             name: { type: 'string', required: true },
+            // The child's Session id lets ACP clients attach native subagent activity to this
+            // parent tool call instead of creating a second, detached task.
+            agent_id: { type: 'string', required: true },
           },
         },
-        render: (_args, value) => [{ type: 'text', text: `started subagent ${value.name}` }],
-        presentationMeta: (_args, value) => ({ kind: value.kind, name: value.name }),
+        render: (_args, value) => [{ type: 'text', text: `started subagent ${value.name} (agent ${value.agent_id})` }],
+        presentationMeta: (_args, value) => ({ kind: value.kind, name: value.name, agent_id: value.agent_id }),
       },
       isConcurrencySafe: () => true,
       async execute(args, exec) {
@@ -331,7 +334,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           signal: exec.signal,
           delivery: 'parent',
         })
-        return { kind: 'activation' as const, name: started.name }
+        return { kind: 'activation' as const, name: started.name, agent_id: String(started.childId) }
       },
     })
     const disposeTool = ctx.effect(() => {
